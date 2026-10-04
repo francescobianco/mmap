@@ -29,3 +29,11 @@ Homestead.json
 .env.production
 .phpactor.json
 auth.json
+
+# mmap
+/mmapgen
+/perft
+/bench
+/bench-count
+/mmap.bin
+*.o
