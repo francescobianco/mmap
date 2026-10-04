@@ -24,11 +24,13 @@ mmap.bin: mmapgen
 test: all
 	./perft test
 
-# pin su un core P (CPU ibrida): evita che il confronto finisca su un core E
+# pin su un core P (CPU ibrida): evita che il confronto finisca su un core E.
+# Senza taskset (es. macOS) il benchmark gira senza pin.
 BENCH_CPU ?= 2
+PIN = $(shell command -v taskset >/dev/null 2>&1 && echo taskset -c $(BENCH_CPU))
 benchmark: bench bench-count mmap.bin
 	./bench-count
-	taskset -c $(BENCH_CPU) ./bench
+	$(PIN) ./bench
 
 clean:
 	rm -f mmapgen perft bench bench-count mmap.bin

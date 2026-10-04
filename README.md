@@ -441,6 +441,12 @@ mmap's loop is flattened.
   instead of do/undo with `StateInfo` and has no hashing.
 - Perft with bulk counting favours generators that produce legal moves
   without make (Stockfish style), as it is meant to.
+- mmap's `pshufb` emission is sensitive to stack layout (4K aliasing, see
+  Experiment 2): about 1 run in 12 is up to 1.75x slower. Run the benchmark a
+  few times, or with `setarch -R`, before comparing numbers.
+- Portability: the fast paths need AVX2/BMI2 (`-march=native`). Without them,
+  scalar fallbacks are used and checked by perft (`-march=x86-64`). Hardware
+  counters are Linux-only; elsewhere the benchmark prints timings only.
 
 ### Reproduce
 
@@ -576,6 +582,27 @@ The children rows are identical under `-O3` within 1–2%.
    destinations keep ~5 mispredicts per position, the same as Stockfish's
    whole generator. In perft the gap widens to 2.3–3.3x because mmap's copy +
    make (about 38 ns) is about 4x Stockfish's.
+
+### Stack-layout sensitivity (4K aliasing)
+
+Repeating the benchmark showed that about **1 run in 12** made `mmap pshufb`
+in the children regime up to 1.75x slower. The bitboard generator was
+unaffected, and with ASLR disabled (`setarch -R`) every run was stable. A
+controlled scan shows the cause. With ASLR off, the stack is shifted in
+64-byte steps by growing an environment variable
+(`PAD=... CHILD_ONLY=1 setarch -R taskset -c 2 ./bench 1024 3`). About 5 of
+64 stack offsets are slow (1408, 1792, 2432, 2560, 2624, 3712 in this build).
+Moving the output move buffer off the stack removes all of them but one.
+
+This is **4K aliasing**. Each view issues a 16-byte store into a hot
+~100-byte move window, followed by several loads. A load whose address
+matches a pending store in the low 12 bits is held back as a possible
+dependency. Which loads collide depends on where the stack lands relative to
+the fixed-offset tables. The bitboard generator does far fewer loads per
+store and does not show it. This is a real property of the approach, not a
+benchmark artifact: an engine built on it would want its move buffers placed
+deliberately. The figures above are from fast-layout runs, which are the
+common case; the slow layouts cost up to 1.75x.
 
 ### Conclusion
 

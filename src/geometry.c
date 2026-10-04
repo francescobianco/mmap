@@ -44,7 +44,7 @@ static int on_board(int f, int r) { return f >= 0 && f < 8 && r >= 0 && r < 8; }
 static int new_key(const int *cells, int n)
 {
     if (NKEYS >= MAX_KEYS) {
-        fprintf(stderr, "MAX_KEYS troppo piccolo\n");
+        fprintf(stderr, "MAX_KEYS too small\n");
         exit(1);
     }
     int k = NKEYS++;
@@ -144,7 +144,7 @@ static void add_view(VList *vl, int sem, int side, int key, int pos, int promo,
                      uint16_t attackers)
 {
     if (NVIEWS >= MAX_VIEWS) {
-        fprintf(stderr, "MAX_VIEWS troppo piccolo\n");
+        fprintf(stderr, "MAX_VIEWS too small\n");
         exit(1);
     }
     if (vl->n == 0)
@@ -257,7 +257,7 @@ static void build_views(void)
         KEYDESC[k] = KEYS[k].len > 1 && desc;
         if (KEYS[k].len > 1 && !asc && !(desc && KEYS[k].len == 2) && KEYS[k].cell[0] < 128 &&
             KEYS[k].cell[KEYS[k].len - 1] < 128) {
-            fprintf(stderr, "chiave %d: ordine delle celle non gestito\n", k);
+            fprintf(stderr, "key %d: unsupported cell order\n", k);
             exit(1);
         }
     }

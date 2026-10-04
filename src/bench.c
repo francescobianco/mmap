@@ -21,10 +21,12 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef __linux__
 #include <linux/perf_event.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #ifdef COUNT_READS
 uint64_t READS_BOARD, READS_KEY, READS_TABLE, READS_GEOM, READS_BB;
@@ -280,6 +282,15 @@ static uint64_t b_child_none(void);
 enum { HW_INSTR, HW_CYCLES, HW_BRANCH, HW_MISS, NHW };
 static int perf_fd[NHW] = { -1, -1, -1, -1 };
 
+#ifndef __linux__
+/* fuori da Linux niente contatori: il benchmark stampa solo i tempi */
+static void perf_init(void) {}
+static int perf_count(uint64_t (*fn)(void), int reps, uint64_t out[NHW])
+{
+    (void)fn, (void)reps, (void)out;
+    return 0;
+}
+#else
 static void perf_init(void)
 {
     static const uint64_t cfg[NHW] = { PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_HW_CPU_CYCLES,
@@ -304,7 +315,7 @@ static void perf_init(void)
         a.read_format = PERF_FORMAT_GROUP;
         perf_fd[i] = syscall(SYS_perf_event_open, &a, 0, -1, i ? perf_fd[0] : -1, 0);
         if (perf_fd[i] < 0) {
-            fprintf(stderr, "contatori hardware non disponibili (perf_event_paranoid > 2?)\n");
+            fprintf(stderr, "hardware counters unavailable (perf_event_paranoid > 2?)\n");
             perf_fd[0] = -1;
             return;
         }
@@ -327,6 +338,7 @@ static int perf_count(uint64_t (*fn)(void), int reps, uint64_t out[NHW])
     memcpy(out, buf + 1, sizeof buf - sizeof *buf);
     return 1;
 }
+#endif
 
 static double now(void)
 {
@@ -369,7 +381,7 @@ static void measure_(const char *title, const Case *c, int nc, int rounds, const
     int hw = perf_fd[0] >= 0;
     printf("  %-28s %9s %6s", "", "ns/" , "");
     if (hw)
-        printf(" %9s %8s %5s %8s %8s%s", "istr.", "cicli", "IPC", "salti", "errati", moves ? "  bit/ciclo" : "");
+        printf(" %9s %8s %5s %8s %8s%s", "instr.", "cycles", "IPC", "branch", "miss", moves ? "  bit/cycle" : "");
     printf("\n");
     for (int k = 0; k < nc; k++) {
         qsort(t[k], rounds, sizeof(double), cmp_d);
@@ -392,9 +404,9 @@ static void measure_(const char *title, const Case *c, int nc, int rounds, const
         }
         int base_row = c[0].fn == b_child_none; /* la prima riga e' la base, non un generatore */
         printf("%s\n", check[k] != check[0] && !base_row && !getenv("BREAKDOWN_ONLY")
-                           ? "  RISULTATO DIVERSO!" : "");
+                           ? "  DIFFERENT RESULT!" : "");
     }
-    printf("  (per %s; rapporto = mediana / mediana della prima riga)\n\n", unit);
+    printf("  (per %s; ratio = median / median of the first row)\n\n", unit);
 }
 
 #define measure(title, c, nc, rounds, unit, units) measure_(title, c, nc, rounds, unit, units, 0)
@@ -431,9 +443,9 @@ static void run_perft(const char *title, const char **names, const PerftFn *fn, 
         int same_nodes = 1;
         for (int k = 1; k < nf; k++)
             same_nodes &= nodes[k] == nodes[0];
-        printf("%s\n", same_nodes ? "" : "  NODI DIVERSI!");
+        printf("%s\n", same_nodes ? "" : "  DIFFERENT NODE COUNTS!");
     }
-    printf("  (rapporto = tempo / tempo della prima colonna; > 1 = piu' lento)\n\n");
+    printf("  (ratio = time / time of the first column; > 1 = slower)\n\n");
 }
 
 int main(int argc, char **argv)
@@ -477,21 +489,29 @@ int main(int argc, char **argv)
         legal += gen_legal(&POS[i], MOVES + legal);
     }
     MOVE_OFF[NPOS] = legal;
-    printf("posizioni: %d   sizeof(Pos) = %zu: scacchiera %zu + bitboard %zu + chiavi %zu byte\n",
+    printf("positions: %d   sizeof(Pos) = %zu: board %zu + bitboards %zu + keys %zu bytes\n",
            NPOS, sizeof(Pos), (size_t)POS_BOARD_BYTES, (size_t)(POS_BB_BYTES - POS_BOARD_BYTES),
            sizeof(Pos) - POS_BB_BYTES);
-    printf("mosse medie: %.1f pseudo-legali, %.1f legali   mmap: %u byte\n",
+    printf("average moves: %.1f pseudo-legal, %.1f legal   mmap: %u bytes\n",
            (double)pseudo / NPOS, (double)legal / NPOS, TABLE_SIZE);
 
+    if (getenv("CHILD_ONLY")) { /* diagnostica: solo il regime figli, senza verifiche */
+        const Case cc[] = { { "base", b_child_none }, { "pseudo bitboard", b_child_pseudo_bb },
+                            { "pseudo mmap pshufb", b_child_pseudo_shuf },
+                            { "legal hybrid", b_child_legal_hyb } };
+        measure_moves("children regime", cc, 4, rounds, "child", legal);
+        return 0;
+    }
+
     int bad = crosscheck();
-    printf("verifica incrociata (5 pseudo, 12 legali, attacchi su 64 case x 2 lati): %s\n\n",
-           bad ? "DIFFERENZE TROVATE" : "identici");
+    printf("cross-check (5 pseudo-legal, 12 legal generators, attacks on 64 squares x 2 sides): %s\n\n",
+           bad ? "DIFFERENCES FOUND" : "identical");
     if (bad)
         return 1;
 
 #ifdef COUNT_READS
-    printf("== letture per posizione ==\n");
-    printf("  %-24s %8s %8s %8s %8s %8s\n", "", "board", "key", "mmap", "bitboard", "geometria");
+    printf("== state reads per position ==\n");
+    printf("  %-24s %8s %8s %8s %8s %8s\n", "", "board", "key", "mmap", "bitboard", "geometry");
 #define READS(label, expr)                                                       \
     do {                                                                         \
         READS_BOARD = READS_KEY = READS_TABLE = READS_GEOM = READS_BB = 0;       \
@@ -502,92 +522,92 @@ int main(int argc, char **argv)
                (double)READS_GEOM / NPOS);                                       \
     } while (0)
     READS("pseudo mmap", b_pseudo_mmap());
-    READS("pseudo classico", b_pseudo_if());
+    READS("pseudo classic", b_pseudo_if());
     READS("pseudo bitboard", b_pseudo_bb());
-    READS("pseudo mmap piatto", b_pseudo_flat());
-    READS("attacco re mmap", b_king_mmap());
-    READS("attacco re classico", b_king_if());
-    READS("attacco re bitboard", b_king_bb());
-    READS("legali mmap", b_legal_mmap());
-    READS("legali classico", b_legal_if());
-    READS("legali bitboard gen.", b_legal_bb());
-    READS("legali stockfish", b_legal_sf());
-    READS("legali mmap interferenza", b_legal_int());
-    READS("legali mmap interf. piatto", b_legal_flat());
+    READS("pseudo mmap flat", b_pseudo_flat());
+    READS("king attack mmap", b_king_mmap());
+    READS("king attack classic", b_king_if());
+    READS("king attack bitboard", b_king_bb());
+    READS("legal mmap", b_legal_mmap());
+    READS("legal classic", b_legal_if());
+    READS("legal bitboard gen.", b_legal_bb());
+    READS("legal stockfish", b_legal_sf());
+    READS("legal mmap interference", b_legal_int());
+    READS("legal mmap interf. flat", b_legal_flat());
     return 0;
 #endif
 
-    const Case pseudo_c[] = { { "mmap", b_pseudo_mmap }, { "classico IF", b_pseudo_if },
-                              { "bitboard", b_pseudo_bb }, { "mmap piatto", b_pseudo_flat },
+    const Case pseudo_c[] = { { "mmap", b_pseudo_mmap }, { "classic IF", b_pseudo_if },
+                              { "bitboard", b_pseudo_bb }, { "mmap flat", b_pseudo_flat },
                               { "mmap pshufb", b_pseudo_shuf }, { "mmap gather+pshufb", b_pseudo_gather } };
-    const Case king_c[] = { { "mmap", b_king_mmap }, { "classico IF", b_king_if },
+    const Case king_c[] = { { "mmap", b_king_mmap }, { "classic IF", b_king_if },
                             { "bitboard", b_king_bb } };
-    const Case att_c[] = { { "mmap", b_att_mmap }, { "classico IF", b_att_if },
+    const Case att_c[] = { { "mmap", b_att_mmap }, { "classic IF", b_att_if },
                            { "bitboard", b_att_bb } };
-    const Case legal_c[] = { { "mmap", b_legal_mmap }, { "classico IF", b_legal_if },
-                             { "bitboard (filtro generico)", b_legal_bb },
+    const Case legal_c[] = { { "mmap", b_legal_mmap }, { "classic IF", b_legal_if },
+                             { "bitboard (shared filter)", b_legal_bb },
                              { "bitboard stockfish", b_legal_sf },
-                             { "mmap interferenza", b_legal_int },
-                             { "mmap interf. piatto", b_legal_flat } };
-    const Case own_c[] = { { "mmap (scacch.+chiavi)", b_legal_mmap_own },
-                           { "classico IF (scacch.)", b_legal_if_board },
-                           { "stockfish (scacch.+bb)", b_legal_sf },
-                           { "mmap interf. (scacch.+chiavi)", b_legal_int },
-                           { "mmap interf. piatto (idem)", b_legal_flat },
-                           { "mmap interf. pshufb (idem)", b_legal_shuf },
-                           { "mmap interf. gather (idem)", b_legal_gather },
-                           { "ibrido (scacch.+bb+chiavi)", b_legal_hyb },
-                           { "ibrido pdep (idem)", b_legal_hyb_pdep } };
-    const Case child_c[] = { { "solo copia+make (base)", b_child_none },
+                             { "mmap interference", b_legal_int },
+                             { "mmap interf. flat", b_legal_flat } };
+    const Case own_c[] = { { "mmap (board+keys)", b_legal_mmap_own },
+                           { "classic IF (board)", b_legal_if_board },
+                           { "stockfish (board+bb)", b_legal_sf },
+                           { "mmap interf. (board+keys)", b_legal_int },
+                           { "mmap interf. flat (same)", b_legal_flat },
+                           { "mmap interf. pshufb (same)", b_legal_shuf },
+                           { "mmap interf. gather (same)", b_legal_gather },
+                           { "hybrid (board+bb+keys)", b_legal_hyb },
+                           { "hybrid pdep (same)", b_legal_hyb_pdep } };
+    const Case child_c[] = { { "copy+make only (base)", b_child_none },
                              { "pseudo bitboard", b_child_pseudo_bb },
-                             { "pseudo mmap piatto", b_child_pseudo_flat },
+                             { "pseudo mmap flat", b_child_pseudo_flat },
                              { "pseudo mmap pshufb", b_child_pseudo_shuf },
-                             { "legali stockfish", b_child_legal_sf },
-                             { "legali mmap piatto", b_child_legal_flat },
-                             { "legali mmap pshufb", b_child_legal_shuf },
-                             { "legali ibrido", b_child_legal_hyb },
-                             { "legali ibrido pdep", b_child_legal_hyb_pdep } };
-    const Case make_c[] = { { "tutto lo stato", b_make_all }, { "scacchiera + chiavi", b_make_keys },
-                            { "scacchiera + bitboard", b_make_bb },
-                            { "solo scacchiera", b_make_board } };
+                             { "legal stockfish", b_child_legal_sf },
+                             { "legal mmap flat", b_child_legal_flat },
+                             { "legal mmap pshufb", b_child_legal_shuf },
+                             { "legal hybrid", b_child_legal_hyb },
+                             { "legal hybrid pdep", b_child_legal_hyb_pdep } };
+    const Case make_c[] = { { "whole state", b_make_all }, { "board + keys", b_make_keys },
+                            { "board + bitboards", b_make_bb },
+                            { "board only", b_make_board } };
 
-    measure_moves("generazione pseudo-legale (a parita' di stato)", pseudo_c, 6, rounds, "pos", NPOS);
-    measure("test d'attacco sulla casa del re", king_c, 3, rounds, "query", NPOS);
-    measure("test d'attacco su tutte le 64 case", att_c, 3, rounds, "query", NPOS * 64ull);
-    measure("generazione legale (a parita' di stato: copia+make dell'intera Pos)", legal_c, 6,
+    measure_moves("pseudo-legal generation (same state)", pseudo_c, 6, rounds, "pos", NPOS);
+    measure("attack test on the king square", king_c, 3, rounds, "query", NPOS);
+    measure("attack test on all 64 squares", att_c, 3, rounds, "query", NPOS * 64ull);
+    measure("legal generation (same state: copy+make of the whole Pos)", legal_c, 6,
             rounds, "pos", NPOS);
-    measure("costo dello stato: copia + make per mossa", make_c, 4, rounds, "mossa", legal);
-    measure_moves("regime figli: stato caldo, posizioni mai ripetute (sottrarre la base)", child_c,
-                  9, rounds, "figlio", legal);
-    measure_moves("generazione legale, ognuno con il SOLO stato proprio", own_c, 9, rounds, "pos", NPOS);
+    measure("cost of the state: copy + make per move", make_c, 4, rounds, "move", legal);
+    measure_moves("children regime: hot state, never-repeated positions (subtract the base)", child_c,
+                  9, rounds, "child", legal);
+    measure_moves("legal generation, each engine with ONLY its own state", own_c, 9, rounds, "pos", NPOS);
 
-    const Case brk_c[] = { { "mmap: tutto", b_legal_flat },
-                           { "mmap: interferenze re", b_mm_int },
-                           { "mmap: raccolta viste", b_mm_collect },
-                           { "mmap: raccolta+emissione", b_mm_gen },
-                           { "mmap: mosse del re", b_mm_king },
-                           { "ibrido: tutto", b_legal_hyb },
-                           { "ibrido: scacchi+inchiod.", b_hyb_int },
-                           { "ibrido: mosse del re", b_hyb_king },
-                           { "sf: tutto", b_legal_sf },
-                           { "sf: scacchi+inchiodature", b_sf_int },
-                           { "sf: pedoni", b_sf_pawn },
-                           { "sf: pezzi N B R Q", b_sf_piece },
-                           { "sf: re", b_sf_king } };
-    measure("scomposizione della generazione legale (fasi isolate)", brk_c, 13, rounds, "pos",
+    const Case brk_c[] = { { "mmap: all", b_legal_flat },
+                           { "mmap: king interference", b_mm_int },
+                           { "mmap: collect views", b_mm_collect },
+                           { "mmap: collect+emit", b_mm_gen },
+                           { "mmap: king moves", b_mm_king },
+                           { "hybrid: all", b_legal_hyb },
+                           { "hybrid: checks+pins", b_hyb_int },
+                           { "hybrid: king moves", b_hyb_king },
+                           { "sf: all", b_legal_sf },
+                           { "sf: checks+pins", b_sf_int },
+                           { "sf: pawns", b_sf_pawn },
+                           { "sf: pieces N B R Q", b_sf_piece },
+                           { "sf: king", b_sf_king } };
+    measure("legal generation breakdown (isolated phases)", brk_c, 13, rounds, "pos",
             NPOS);
     if (getenv("BREAKDOWN_ONLY"))
         return 0;
 
     int pr = rounds < 5 ? rounds : 5;
-    const char *pn1[] = { "mmap", "classico IF", "bitboard gen.", "stockfish", "mmap interf.",
-                          "mmap piatto" };
+    const char *pn1[] = { "mmap", "classic IF", "bitboard gen.", "stockfish", "mmap interf.",
+                          "mmap flat" };
     const PerftFn pf1[] = { perft_mmap, perft_if, perft_bb, perft_sf, perft_int, perft_flat };
-    run_perft("perft a parita' di stato (intera Pos copiata e aggiornata)", pn1, pf1, 6, pr);
-    const char *pn2[] = { "mmap", "classico IF", "stockfish", "mmap interf.", "mmap piatto",
-                          "mmap pshufb", "mmap gather", "ibrido" };
+    run_perft("perft, same state (whole Pos copied and updated)", pn1, pf1, 6, pr);
+    const char *pn2[] = { "mmap", "classic IF", "stockfish", "mmap interf.", "mmap flat",
+                          "mmap pshufb", "mmap gather", "hybrid" };
     const PerftFn pf2[] = { perft_mmap_own, perft_if_own, perft_sf_own, perft_int_own,
                             perft_flat_own, perft_shuf_own, perft_gather_own, perft_hyb_own };
-    run_perft("perft con il solo stato proprio di ciascun motore", pn2, pf2, 8, pr);
+    run_perft("perft, each engine with only its own state", pn2, pf2, 8, pr);
     return 0;
 }

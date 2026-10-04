@@ -58,7 +58,7 @@ static int run(const char *fen, int depth, uint64_t expect, int divide)
 {
     Pos p;
     if (pos_from_fen(&p, fen)) {
-        fprintf(stderr, "FEN non valida: %s\n", fen);
+        fprintf(stderr, "invalid FEN: %s\n", fen);
         return 1;
     }
     double t0 = now();
@@ -107,7 +107,7 @@ int main(int argc, char **argv)
         int fails = 0;
         for (size_t i = 0; i < sizeof T / sizeof *T; i++)
             fails += run(T[i].fen, T[i].depth, T[i].nodes, 0);
-        printf("%s\n", fails ? "QUALCOSA NON VA" : "tutte le posizioni corrispondono");
+        printf("%s\n", fails ? "SOMETHING IS WRONG" : "all positions match");
         return fails != 0;
     }
 

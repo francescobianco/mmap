@@ -141,7 +141,7 @@ int main(int argc, char **argv)
         perror(path);
         return 1;
     }
-    printf("%s: %u byte, %d chiavi, %d viste\n", path, TABLE_SIZE, NKEYS, NVIEWS);
+    printf("%s: %u bytes, %d keys, %d views\n", path, TABLE_SIZE, NKEYS, NVIEWS);
     free(table);
     return 0;
 }

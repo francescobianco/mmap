@@ -45,7 +45,7 @@ int mmap_load(const char *path)
     const MMapHeader *h = (const MMapHeader *)p;
     if ((size_t)st.st_size < sizeof *h || memcmp(h->magic, MMAP_MAGIC, 8) ||
         h->size != TABLE_SIZE || (size_t)st.st_size != sizeof *h + h->size) {
-        fprintf(stderr, "%s: file non valido o generato da una geometria diversa\n", path);
+        fprintf(stderr, "%s: invalid file or built from a different geometry\n", path);
         return -1;
     }
     MM = p + sizeof *h;
@@ -434,7 +434,6 @@ static inline __attribute__((always_inline)) int emit_view(const Pos *p, Move *o
         }
         return n;
     }
-#ifdef __AVX2__
     if (legal && a != ~0ull) /* scacco o pezzo inchiodato: celle consentite in un'istruzione
                                 (le celle di ogni chiave sono in ordine crescente di casa) */
     {
@@ -443,10 +442,16 @@ static inline __attribute__((always_inline)) int emit_view(const Pos *p, Move *o
             keep = (keep >> 1 | keep << 1) & 3;
         m &= EXPAND[v->promo][keep];
     }
+#ifdef __AVX2__
     __m128i mv = _mm_loadu_si128((const __m128i *)v->mv);
     _mm_storeu_si128((__m128i *)(out + n), _mm_shuffle_epi8(mv, SHUF[m]));
     return n + __builtin_popcount(m);
 #else
+    /* senza AVX2: stessa compattazione senza rami, in forma scalare */
+    for (int k = 0; k < v->nmv; k++) {
+        out[n] = v->mv[k];
+        n += m >> k & 1;
+    }
     return n;
 #endif
 }
