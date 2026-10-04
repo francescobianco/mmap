@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 Key KEYS[MAX_KEYS];
 int NKEYS;
@@ -17,6 +18,12 @@ View VIEWS[MAX_VIEWS];
 int NVIEWS;
 VList GV[2][NPIECES][64];
 VList AV[2][64];
+VList GVL[2][NPIECES][64];
+VList KL[2][64];
+VList KR[2][64];
+uint64_t KEYBB[MAX_KEYS];
+uint8_t KEYDESC[MAX_KEYS];
+uint8_t EXPAND[3][256];
 uint32_t BASE[NSEM][2][MAXLEN + 1];
 uint32_t TABLE_SIZE;
 const uint32_t POW3[MAXLEN + 1] = { 1, 3, 9, 27, 81, 243, 729, 2187, 6561 };
@@ -56,6 +63,13 @@ static int ring_key(int sq, const int (*jump)[2])
     for (int i = 0; i < 8; i++)
         if (on_board(f + jump[i][0], r + jump[i][1]))
             cells[n++] = (r + jump[i][1]) * 8 + f + jump[i][0];
+    /* celle in ordine crescente di casa: pdep(maschera, KEYBB) da' il bitboard */
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0 && cells[j - 1] > cells[j]; j--) {
+            int t = cells[j];
+            cells[j] = cells[j - 1];
+            cells[j - 1] = t;
+        }
     return new_key(cells, n);
 }
 
@@ -121,9 +135,9 @@ static void build_bases(void)
         for (int s = 0; s < 2; s++)
             for (int len = 1; len <= MAXLEN; len++) {
                 BASE[sem][s][len] = off;
-                off += POW3[len] * MAXLEN;
+                off += POW3[len] * MAXLEN * ESIZE(sem);
             }
-    TABLE_SIZE = off;
+    TABLE_SIZE = off + 16; /* margine: le gather leggono 4 byte per voce */
 }
 
 static void add_view(VList *vl, int sem, int side, int key, int pos, int promo,
@@ -142,6 +156,8 @@ static void add_view(VList *vl, int sem, int side, int key, int pos, int promo,
     v->pos = pos;
     v->promo = promo;
     v->attackers = attackers;
+    v->sem = sem;
+    v->cap = sem == SEM_CAPT && KEYS[key].len && KEYS[key].cell[0] >= 64 && KEYS[key].cell[0] < 128;
     for (int i = 0; i < KEYS[key].len; i++) {
         int c = KEYS[key].cell[i];
         v->to[i] = c < 64 ? c : c < 128 ? c - 64 : 0;
@@ -195,6 +211,12 @@ static void build_views(void)
             }
         }
 
+    /* liste per la generazione legale: identiche, ma il re e' gestito a parte */
+    for (int s = 0; s < 2; s++)
+        for (int pc = 1; pc < NPIECES; pc++)
+            if (TYPE(pc) != KING)
+                memcpy(GVL[s][pc], GV[s][pc], sizeof GV[s][pc]);
+
     /* viste di attacco: la casa guarda "come un super-pezzo" del lato us */
     for (int us = 0; us < 2; us++) {
         int e = us == WHITE ? 6 : 0; /* offset dei pezzi nemici */
@@ -208,7 +230,63 @@ static void build_views(void)
             if (capt_key[us][sq] >= 0)
                 add_view(vl, SEM_CAPT, us, capt_key[us][sq], 0, 0, BIT(PAWN));
         }
+        /* viste del re: interferenze sulle 4 linee, scacchi di cavallo e pedone */
+        for (int sq = 0; sq < 64; sq++) {
+            add_lines(&KL[us][sq], SEM_KING, us, sq, 0, 1, BIT(ROOK) | BIT(QUEEN));
+            add_lines(&KL[us][sq], SEM_KING, us, sq, 2, 3, BIT(BISHOP) | BIT(QUEEN));
+            add_view(&KR[us][sq], SEM_CAPT, us, knight_key[sq], 0, 0, BIT(KNIGHT));
+            if (capt_key[us][sq] >= 0)
+                add_view(&KR[us][sq], SEM_CAPT, us, capt_key[us][sq], 0, 0, BIT(PAWN));
+        }
 #undef BIT
+    }
+
+    for (int k = 0; k < NKEYS; k++) {
+        int asc = 1, desc = 1;
+        for (int i = 0; i < KEYS[k].len; i++) {
+            if (KEYS[k].cell[i] < 128)
+                KEYBB[k] |= 1ull << (KEYS[k].cell[i] & 63);
+            if (i) {
+                asc &= KEYS[k].cell[i] > KEYS[k].cell[i - 1];
+                desc &= KEYS[k].cell[i] < KEYS[k].cell[i - 1];
+            }
+        }
+        /* pext(x, KEYBB) restituisce le celle in ordine di casa: va bene per
+           le chiavi crescenti; le uniche decrescenti sono le spinte doppie
+           del nero (2 celle), per cui basta scambiare i due bit */
+        KEYDESC[k] = KEYS[k].len > 1 && desc;
+        if (KEYS[k].len > 1 && !asc && !(desc && KEYS[k].len == 2) && KEYS[k].cell[0] < 128 &&
+            KEYS[k].cell[KEYS[k].len - 1] < 128) {
+            fprintf(stderr, "chiave %d: ordine delle celle non gestito\n", k);
+            exit(1);
+        }
+    }
+
+    /* mosse pronte nelle viste di generazione: il ciclo appiattito le copia
+       e tiene solo quelle il cui bit e' acceso */
+    for (int s = 0; s < 2; s++)
+        for (int pc = 1; pc < NPIECES; pc++)
+            for (int sq = 0; sq < 64; sq++) {
+                VList vl = GV[s][pc][sq];
+                for (int i = 0; i < vl.n; i++) {
+                    View *v = &VIEWS[vl.first + i];
+                    int q = s == WHITE ? WQ : BQ;
+                    for (int k = 0; k < 8; k++)
+                        v->mv[k] = mk_move(sq, sq, EMPTY);
+                    v->nmv = v->promo ? 4 * KEYS[v->key].len : KEYS[v->key].len;
+                    for (int c = 0; c < KEYS[v->key].len; c++) {
+                        if (!v->promo) {
+                            v->mv[c] = mk_move(sq, v->to[c], EMPTY);
+                            continue;
+                        }
+                        for (int j = 0; j < 4; j++)
+                            v->mv[4 * c + j] = mk_move(sq, v->to[c], q - j);
+                    }
+                }
+            }
+    for (int m = 0; m < 256; m++) {
+        EXPAND[0][m] = m;
+        EXPAND[1][m] = (m & 1 ? 0x0F : 0) | (m & 2 ? 0xF0 : 0);
     }
 }
 

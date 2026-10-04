@@ -7,7 +7,7 @@ mmapgen: src/mmapgen.c src/geometry.c src/mmap.h
 	$(CC) $(CFLAGS) -o $@ src/mmapgen.c src/geometry.c
 
 ENGINE  = src/engine.c src/geometry.c src/classic.c src/bitboard.c
-HEADERS = src/mmap.h
+HEADERS = src/mmap.h src/bitboard.h
 
 perft: src/perft.c $(ENGINE) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ src/perft.c $(ENGINE)

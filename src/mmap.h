@@ -28,8 +28,13 @@ enum {
     SEM_CAPT,   /* anello: solo celle occupate dal nemico */
     SEM_CASTLE, /* raggio: destinazione (bit 1) solo se tutto e' vuoto */
     SEM_HIT,    /* linea: solo il primo pezzo nemico nei due versi (attacchi) */
+    SEM_KING,   /* linea letta dal re: interferenze (scacchi, inchiodature),
+                   voce da 8 byte, vedi mmapgen.c */
     NSEM
 };
+
+/* byte per voce della tabella: 1 per tutte le semantiche, 8 per SEM_KING */
+#define ESIZE(sem) ((sem) == SEM_KING ? 8 : 1)
 
 /*
  * Spazio delle celle osservabili:
@@ -47,7 +52,7 @@ enum {
 #define MAX_MEMB  32
 #define MAX_VIEWS 4096
 
-#define MMAP_MAGIC "MMAPCHS1"
+#define MMAP_MAGIC "MMAPCHS2"
 
 typedef struct {
     uint8_t len;
@@ -59,14 +64,32 @@ typedef struct {
     uint16_t w;     /* peso 3^i della cella dentro la chiave */
 } Member;
 
+/* Mossa in 16 bit: da (6) | a (6) | pezzo di promozione (4). Il formato
+   compatto permette di compattare 8 mosse in un registro da 128 bit. */
+typedef uint16_t Move;
+
+#define MV_FROM(m)  ((m) & 63)
+#define MV_TO(m)    ((m) >> 6 & 63)
+#define MV_PROMO(m) ((m) >> 12)
+
+static inline Move mk_move(int from, int to, int promo)
+{
+    return (Move)(from | to << 6 | promo << 12);
+}
+
 /* Una vista: "questo pezzo, su questa casa, legge questa chiave". */
 typedef struct {
     uint32_t base;      /* offset nella mmap per (semantica, colore, lunghezza) */
     uint16_t key;
     uint8_t pos;
     uint8_t promo;      /* 1 = ogni destinazione genera 4 promozioni */
+    uint8_t sem;
+    uint8_t cap;        /* 1 = cattura di pedone: puo' colpire il fantasma e.p. */
+    uint8_t nmv;        /* mosse pronte valide in mv[] */
     uint16_t attackers; /* solo viste di attacco: pezzi che colpiscono */
     uint8_t to[MAXLEN]; /* bit della maschera -> casa */
+    Move mv[8];         /* viste di generazione: mosse gia' pronte, una per
+                           bit della maschera espansa (promozioni: 4 per cella) */
 } View;
 
 typedef struct {
@@ -88,6 +111,13 @@ extern View VIEWS[MAX_VIEWS];
 extern int NVIEWS;
 extern VList GV[2][NPIECES][64]; /* viste di generazione [lato][pezzo][casa] */
 extern VList AV[2][64];          /* viste di attacco    [lato][casa]        */
+extern VList GVL[2][NPIECES][64]; /* come GV ma senza il re (gen. legale)    */
+extern VList KL[2][64];          /* re in casa: 4 linee SEM_KING            */
+extern VList KR[2][64];          /* re in casa: anelli cavallo e pedone     */
+extern uint64_t KEYBB[MAX_KEYS]; /* case reali di ogni chiave               */
+extern uint8_t KEYDESC[MAX_KEYS]; /* celle in ordine decrescente (spinte del nero) */
+extern uint8_t EXPAND[3][256];   /* [promo][maschera] -> maschera su mv[];
+                                    terza riga: margine per le gather */
 extern uint32_t BASE[NSEM][2][MAXLEN + 1];
 extern uint32_t TABLE_SIZE;
 extern const uint32_t POW3[MAXLEN + 1];
@@ -95,9 +125,6 @@ extern const uint32_t POW3[MAXLEN + 1];
 void geometry_init(void);
 
 /* engine.c */
-typedef struct {
-    uint8_t from, to, promo;
-} Move;
 
 /*
  * Stato della partita, in tre sezioni:
@@ -141,6 +168,13 @@ extern uint64_t READS_BOARD, READS_KEY, READS_TABLE, READS_GEOM, READS_BB;
 static inline int piece_at(const Pos *p, int sq) { COUNT(READS_BOARD); return p->board[sq]; }
 static inline unsigned key_at(const Pos *p, int k) { COUNT(READS_KEY); return p->key[k]; }
 static inline unsigned mm_at(uint32_t i) { COUNT(READS_TABLE); return MM[i]; }
+static inline uint64_t mm64_at(uint32_t i)
+{
+    uint64_t v;
+    COUNT(READS_TABLE);
+    memcpy(&v, MM + i, 8);
+    return v;
+}
 static inline uint64_t bb_type(const Pos *p, int t) { COUNT(READS_BB); return p->by_type[t]; }
 static inline uint64_t bb_color(const Pos *p, int c) { COUNT(READS_BB); return p->by_color[c]; }
 static inline uint64_t bb_pieces(const Pos *p, int c, int t) { return bb_type(p, t) & bb_color(p, c); }
@@ -152,15 +186,17 @@ static inline int king_square(const Pos *p, int s) { return p->ksq[s]; }
 static inline void pos_copy(Pos *d, const Pos *s) { *d = *s; }
 static inline void pos_copy_board(Pos *d, const Pos *s) { memcpy(d, s, POS_BOARD_BYTES); }
 static inline void pos_copy_bb(Pos *d, const Pos *s) { memcpy(d, s, POS_BB_BYTES); }
+/* stato proprio di mmap: scacchiera, occupazione per colore, chiavi */
 static inline void pos_copy_keys(Pos *d, const Pos *s)
 {
     memcpy(d, s, POS_BOARD_BYTES);
+    memcpy(d->by_color, s->by_color, sizeof s->by_color);
     memcpy(d->key, s->key, sizeof s->key);
 }
 
 static inline int emit(Move *out, int n, int from, int to, int promo)
 {
-    out[n] = (Move){ (uint8_t)from, (uint8_t)to, (uint8_t)promo };
+    out[n] = mk_move(from, to, promo);
     return n + 1;
 }
 
@@ -175,9 +211,9 @@ static inline int emit(Move *out, int n, int from, int to, int promo)
         int n = gen(p, ps), k = 0, us = side_to_move(p);                         \
         for (int i = 0; i < n; i++) {                                            \
             Move m = ps[i];                                                      \
-            if (TYPE(piece_at(p, m.from)) == KING &&                             \
-                (m.to - m.from == 2 || m.from - m.to == 2) &&                    \
-                (att(p, m.from, us) || att(p, (m.from + m.to) / 2, us)))         \
+            if (TYPE(piece_at(p, MV_FROM(m))) == KING &&                             \
+                (MV_TO(m) - MV_FROM(m) == 2 || MV_FROM(m) - MV_TO(m) == 2) &&                    \
+                (att(p, MV_FROM(m), us) || att(p, (MV_FROM(m) + MV_TO(m)) / 2, us)))         \
                 continue;                                                        \
             Pos q;                                                               \
             copy(&q, p);                                                         \
@@ -199,6 +235,39 @@ void make_move_board(Pos *p, Move m); /* solo scacchiera */
 void make_move_bb(Pos *p, Move m);    /* scacchiera + bitboard */
 void make_move_keys(Pos *p, Move m);  /* scacchiera + chiavi */
 int gen_legal_own(const Pos *p, Move *out); /* mmap con il solo stato proprio */
+int gen_legal_int(const Pos *p, Move *out); /* mmap con legalita' per interferenza */
+int gen_pseudo_flat(const Pos *p, Move *out); /* come gen_pseudo, cicli appiattiti */
+int gen_legal_flat(const Pos *p, Move *out);  /* come gen_legal_int, cicli appiattiti */
+
+/* Emissione senza rami: le 8 mosse pronte di una vista (8 x 16 bit = 128 bit)
+   vengono compattate con pshufb e una tabella di 256 maschere.
+   "gather" in piu' legge 8 viste alla volta con vpgatherdd (AVX2).
+   Scrivono fino a 8 mosse oltre la fine: il buffer deve avere margine. */
+int gen_pseudo_shuf(const Pos *p, Move *out);
+int gen_pseudo_gather(const Pos *p, Move *out);
+int gen_legal_shuf(const Pos *p, Move *out);
+int gen_legal_gather(const Pos *p, Move *out);
+
+/* Ibrido: emissione mmap (pshufb) + sicurezza del re con l'algebra degli
+   insiemi dei bitboard. Stato proprio: scacchiera + bitboard + chiavi.
+   _pdep: le destinazioni del re si verificano con le viste di attacco di
+   mmap convertite in bitboard con PDEP, invece che con attackers_to. */
+int gen_legal_hyb(const Pos *p, Move *out);
+int gen_legal_hyb_pdep(const Pos *p, Move *out);
+int hyb_phase_int(const Pos *p, Move *out);  /* scacchi e inchiodature */
+int hyb_phase_king(const Pos *p, Move *out); /* mosse del re */
+
+/* Scomposizione per l'analisi: ogni fase isolata, specializzata a tempo
+   di compilazione (il resto del generatore non viene eseguito). */
+enum { PH_INT = 1, PH_PAWN = 2, PH_PIECE = 4, PH_KING = 8, PH_EMIT = 16, PH_ALL = 31 };
+int mm_phase_int(const Pos *p, Move *out);     /* interferenze sul re */
+int mm_phase_collect(const Pos *p, Move *out); /* raccolta delle viste attive */
+int mm_phase_gen(const Pos *p, Move *out);     /* raccolta + emissione, senza legalita' */
+int mm_phase_king(const Pos *p, Move *out);    /* mosse del re verificate */
+int sf_phase_int(const Pos *p, Move *out);     /* scacchi e inchiodature */
+int sf_phase_pawn(const Pos *p, Move *out);
+int sf_phase_piece(const Pos *p, Move *out);
+int sf_phase_king(const Pos *p, Move *out);
 void move_str(Move m, char *buf);
 
 /* classic.c: generatore tradizionale a IF sulla stessa struttura Pos */

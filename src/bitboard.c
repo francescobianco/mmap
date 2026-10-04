@@ -12,52 +12,17 @@
  * Legge lo stato tramite le primitive di mmap.h (bb_type, bb_color,
  * side_to_move, ep_square, castle_rights, king_square) ed emette con emit().
  */
-#include "mmap.h"
+#include "bitboard.h"
 
-#ifdef __BMI2__
-#include <immintrin.h>
-#endif
-
-typedef uint64_t Bits;
-
-#define FILE_A 0x0101010101010101ull
-#define FILE_H (FILE_A << 7)
-#define RANK_1 0xFFull
-#define RANK_8 (RANK_1 << 56)
-#define RANK_2 (RANK_1 << 8)
-#define RANK_3 (RANK_1 << 16)
-#define RANK_6 (RANK_1 << 40)
-#define RANK_7 (RANK_1 << 48)
-
-static Bits KNIGHT_ATT[64], KING_ATT[64], PAWN_ATT[2][64];
-static Bits ROOK_PSEUDO[64], BISHOP_PSEUDO[64];
-static Bits ROOK_MASK[64], BISHOP_MASK[64];
-static uint32_t ROOK_OFF[64], BISHOP_OFF[64];
-static Bits ROOK_TAB[0x19000], BISHOP_TAB[0x1480];
-static Bits BETWEEN[64][64], LINE[64][64];
+Bits KNIGHT_ATT[64], KING_ATT[64], PAWN_ATT[2][64];
+Bits ROOK_PSEUDO[64], BISHOP_PSEUDO[64];
+Bits ROOK_MASK[64], BISHOP_MASK[64];
+uint32_t ROOK_OFF[64], BISHOP_OFF[64];
+Bits ROOK_TAB[0x19000], BISHOP_TAB[0x1480];
+Bits BETWEEN[64][64], LINE[64][64];
 
 static const int RD[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
 static const int BD[4][2] = { { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } };
-
-static inline Bits pext(Bits x, Bits m)
-{
-#ifdef __BMI2__
-    return _pext_u64(x, m);
-#else
-    Bits r = 0;
-    for (Bits bit = 1; m; m &= m - 1, bit <<= 1)
-        if (x & m & -m)
-            r |= bit;
-    return r;
-#endif
-}
-
-static inline int pop(Bits *b)
-{
-    int s = __builtin_ctzll(*b);
-    *b &= *b - 1;
-    return s;
-}
 
 static Bits slide(int sq, Bits occ, const int (*d)[2])
 {
@@ -92,6 +57,10 @@ static void init_slider(Bits *mask, uint32_t *off, Bits *tab, Bits *pseudo, cons
 
 void bitboard_init(void)
 {
+    static int done;
+    if (done)
+        return;
+    done = 1;
     static const int NJ[8][2] = { { 1, 2 }, { 2, 1 }, { 2, -1 }, { 1, -2 },
                                   { -1, -2 }, { -2, -1 }, { -2, 1 }, { -1, 2 } };
     for (int sq = 0; sq < 64; sq++) {
@@ -131,27 +100,6 @@ void bitboard_init(void)
         }
 }
 
-static inline Bits rook_att(int sq, Bits occ)
-{
-    COUNT(READS_GEOM);
-    return ROOK_TAB[ROOK_OFF[sq] + pext(occ, ROOK_MASK[sq])];
-}
-
-static inline Bits bishop_att(int sq, Bits occ)
-{
-    COUNT(READS_GEOM);
-    return BISHOP_TAB[BISHOP_OFF[sq] + pext(occ, BISHOP_MASK[sq])];
-}
-
-static inline Bits attackers_to(const Pos *p, int sq, Bits occ)
-{
-    return (PAWN_ATT[BLACK][sq] & bb_pieces(p, WHITE, PAWN)) |
-           (PAWN_ATT[WHITE][sq] & bb_pieces(p, BLACK, PAWN)) |
-           (KNIGHT_ATT[sq] & bb_type(p, KNIGHT)) | (KING_ATT[sq] & bb_type(p, KING)) |
-           (rook_att(sq, occ) & (bb_type(p, ROOK) | bb_type(p, QUEEN))) |
-           (bishop_att(sq, occ) & (bb_type(p, BISHOP) | bb_type(p, QUEEN)));
-}
-
 int attacked_bb(const Pos *p, int sq, int us)
 {
     return (attackers_to(p, sq, bb_type(p, 0)) & bb_color(p, us ^ 1)) != 0;
@@ -159,13 +107,14 @@ int attacked_bb(const Pos *p, int sq, int us)
 
 /* legal = 0: pseudo-legale (stesso insieme di mmap e classico).
    legal = 1: legale alla Stockfish. Costante: due funzioni specializzate. */
-static inline __attribute__((always_inline)) int gen_(const Pos *p, Move *out, const int legal)
+static inline __attribute__((always_inline)) int gen_(const Pos *p, Move *out, const int legal,
+                                                      const int ph)
 {
     int us = side_to_move(p), them = us ^ 1, n = 0, ksq = king_square(p, us);
     Bits occ = bb_type(p, 0), own = bb_color(p, us), enemy = bb_color(p, them);
     Bits target = ~own, pinned = 0, checkers = 0;
 
-    if (legal) {
+    if (legal && (ph & PH_INT)) {
         checkers = attackers_to(p, ksq, occ) & enemy;
         Bits snipers = ((ROOK_PSEUDO[ksq] & (bb_type(p, ROOK) | bb_type(p, QUEEN))) |
                       (BISHOP_PSEUDO[ksq] & (bb_type(p, BISHOP) | bb_type(p, QUEEN)))) &
@@ -199,7 +148,7 @@ static inline __attribute__((always_inline)) int gen_(const Pos *p, Move *out, c
     } while (0)
 #define SH(b, d) ((d) > 0 ? (b) << (d) : (b) >> -(d))
 
-    {
+    if (ph & PH_PAWN) {
         Bits pawns = bb_pieces(p, us, PAWN), empty = ~occ;
         Bits r7 = us == WHITE ? RANK_7 : RANK_2, r3 = us == WHITE ? RANK_3 : RANK_6;
         Bits p7 = pawns & r7, pn = pawns & ~r7, capt = enemy & target;
@@ -256,7 +205,7 @@ static inline __attribute__((always_inline)) int gen_(const Pos *p, Move *out, c
         }
     }
 
-    for (int pt = KNIGHT; pt <= QUEEN; pt++) {
+    for (int pt = KNIGHT; (ph & PH_PIECE) && pt <= QUEEN; pt++) {
         Bits b = bb_pieces(p, us, pt);
         while (b) {
             int from = pop(&b);
@@ -273,7 +222,7 @@ static inline __attribute__((always_inline)) int gen_(const Pos *p, Move *out, c
     }
 
 king:
-    {
+    if (ph & PH_KING) {
         Bits a = KING_ATT[ksq] & ~own;
         while (a) {
             int to = pop(&a);
@@ -290,6 +239,8 @@ king:
                 n = emit(out, n, ksq, b + 2, EMPTY);
         }
     }
+    if (legal && ph == PH_INT) /* fase isolata: il risultato deve essere usato */
+        n = (int)((checkers ^ pinned ^ target) & 1);
     return n;
 #undef OK
 #undef ADD
@@ -297,7 +248,11 @@ king:
 #undef SH
 }
 
-int gen_pseudo_bb(const Pos *p, Move *out) { return gen_(p, out, 0); }
-int gen_legal_sf(const Pos *p, Move *out) { return gen_(p, out, 1); }
+int gen_pseudo_bb(const Pos *p, Move *out) { return gen_(p, out, 0, PH_ALL); }
+int gen_legal_sf(const Pos *p, Move *out) { return gen_(p, out, 1, PH_ALL); }
+int sf_phase_int(const Pos *p, Move *out) { return gen_(p, out, 1, PH_INT); }
+int sf_phase_pawn(const Pos *p, Move *out) { return gen_(p, out, 1, PH_PAWN); }
+int sf_phase_piece(const Pos *p, Move *out) { return gen_(p, out, 1, PH_PIECE); }
+int sf_phase_king(const Pos *p, Move *out) { return gen_(p, out, 1, PH_KING); }
 
 DEFINE_GEN_LEGAL(gen_legal_bb, gen_pseudo_bb, attacked_bb, make_move, pos_copy)
